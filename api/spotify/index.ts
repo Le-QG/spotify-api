@@ -6,37 +6,44 @@ import { Request, Response } from "express";
 const hour = 60 * 60 * 1000;
 const ignoreCache = process.env.VERCEL ? false : true;
 
-type SpotifyCache = {
+type AppCache = {
   expire_at: number;
-  tracks_expire_at: number;
   access_token: string;
 };
 
-const PLAYLIST_ID = process.env.PLAYLIST_ID ?? "";
+type PlaylistCache = {
+  tracks_expire_at: number;
+};
+
+const DEFAULT_PLAYLIST_ID = process.env.PLAYLIST_ID;
 export default async (req: Request, res: Response) => {
+  const playlistId =
+    req.query.playlistId?.toString() ?? (DEFAULT_PLAYLIST_ID as string);
+  const redisAppKey = `${prefix}:cache`;
+  const redisPlaylistKey = `${prefix}:playlist-cache:${playlistId}`;
+
   console.log();
   if (!spotifyApi) {
     console.error("spotifyApi wasn't defined and request errored");
     return res.status(500).send({ message: "Weird error happened" });
   }
 
+  const cachePipeline = redis.pipeline();
+  cachePipeline.hgetall<AppCache>(redisAppKey);
+  cachePipeline.hgetall<PlaylistCache>(redisPlaylistKey);
   console.debug("Fetching cache...");
-  const cache = ignoreCache
-    ? null
-    : await redis
-        .hgetall<SpotifyCache>(`${prefix}:cache`)
-        .then((e) => {
-          if (!e) return;
-          if (e.expire_at > Date.now() - hour / 12) return e;
-        })
-        .catch((e) => console.error("Enable to fetch cache :", e));
+  const _cache = await cachePipeline
+    .exec()
+    .catch((e) => console.error("Enable to fetch cache :", e));
+  const cache: AppCache | null = _cache[0];
+  const playlistCache: PlaylistCache | null = _cache[1];
 
   cache
-    ? console.debug("Found cache")
-    : console.debug("Cache was invalid. Fetching access token...");
+    ? console.debug("Found app cache")
+    : console.debug("App cache was invalid. Fetching access token...");
 
   let accessToken = "";
-  if (!cache) {
+  if (!cache || cache.expire_at < Date.now() || ignoreCache) {
     await spotifyApi.refreshAccessToken().then(
       function (data: { body: { access_token: string } }) {
         const fetchedAccessToken = data.body["access_token"];
@@ -46,7 +53,7 @@ export default async (req: Request, res: Response) => {
         redis.hset("spotify-api:cache", {
           access_token: fetchedAccessToken,
           expire_at: Date.now() + hour,
-        } as SpotifyCache);
+        } as AppCache);
         accessToken = fetchedAccessToken;
       },
       function (err: any) {
@@ -54,27 +61,29 @@ export default async (req: Request, res: Response) => {
         console.error(err);
       }
     );
-  } else {
-    if (cache.tracks_expire_at > Date.now()) {
-      const keys = await getCachedTracksKey();
-      if (keys) {
-        const pipeline = redis.pipeline();
-        for (const k of keys) {
-          pipeline.hgetall(k);
-        }
-        console.debug("Fetching cached tracks...");
-        const tracks = await pipeline.exec().catch(console.error);
-
-        if (tracks) {
-          console.debug(`Fetched ${tracks.length} cached tracks...`);
-          return res.status(200).send(tracks);
-        }
-        console.debug(
-          "Unable to get cached tracks... Switching to normal no-cache mode"
-        );
+  } else accessToken = cache.access_token;
+  if (
+    !ignoreCache &&
+    playlistCache &&
+    playlistCache.tracks_expire_at > Date.now()
+  ) {
+    const keys = await getCachedTracksKey(playlistId);
+    if (keys) {
+      const pipeline = redis.pipeline();
+      for (const k of keys) {
+        pipeline.hgetall(k);
       }
+      console.debug("Fetching cached tracks...");
+      const tracks = await pipeline.exec().catch(console.error);
+
+      if (tracks) {
+        console.debug(`Fetched ${tracks.length} cached tracks...`);
+        return res.status(200).send(tracks);
+      }
+      console.debug(
+        "Unable to get cached tracks... Switching to normal no-cache mode"
+      );
     }
-    accessToken = cache.access_token;
   }
 
   if (!accessToken)
@@ -85,20 +94,23 @@ export default async (req: Request, res: Response) => {
 
   console.debug("Fetching playlist...");
   const playlist = await spotifyApi
-    .getPlaylist(PLAYLIST_ID)
+    .getPlaylist(playlistId)
     .then((d: { body: {} }) => d.body)
-    .catch((e: any) => {
-      console.error(e);
-      return res
-        .status(500)
-        .send({ message: "Server error while loading the playlist" });
+    .catch((e: any) => ({
+      __error_message: e?.body?.error?.message,
+      __errored: true,
+    }));
+  if (playlist.__errored)
+    return res.status(500).send({
+      message:
+        "Server error while loading the playlist" +
+        (playlist.__error_message ? ` (${playlist.__error_message})` : ""),
     });
-  console.debug(`Found playlist ${PLAYLIST_ID}`);
-
+  console.debug(`Found playlist ${playlistId}`);
   const tracksID = () => {
     var items = playlist["tracks"]["items"];
     return items
-      .splice(0, 25)
+      .splice(0, 50)
       .sort(() => (Math.random() < 0.5 ? 1 : -1))
       .map((t: any) => t["track"]["id"]);
   };
@@ -114,17 +126,16 @@ export default async (req: Request, res: Response) => {
         artists: t.artists.map((a) => a.name).join(", "),
       }))
     )
-    .catch((e: any) => {
-      console.error(e);
-      return res
-        .status(500)
-        .send({ message: "Server error while getting the tracks" });
-    });
+    .catch((e: any) => console.error(e));
+  if (!tracks)
+    return res
+      .status(500)
+      .send({ message: "Server error while loading the tracks" });
   console.debug(`Found ${tracks.length} tracks`);
 
   console.debug("Caching tracks...");
 
-  const keys = await getCachedTracksKey();
+  const keys = await getCachedTracksKey(playlistId);
 
   const pipeline = redis.pipeline();
   if (keys)
@@ -132,11 +143,11 @@ export default async (req: Request, res: Response) => {
       pipeline.del(k);
     }
   for (const t of tracks) {
-    pipeline.hset(`${prefix}:tracks:${t.id}`, t);
+    pipeline.hset(`${prefix}:playlist:${playlistId}:tracks:${t.id}`, t);
   }
-  pipeline.hset(`${prefix}:cache`, {
-    tracks_expire_at: Date.now() + hour / 4,
-  } as SpotifyCache);
+  pipeline.hset(redisPlaylistKey, {
+    tracks_expire_at: Date.now() + hour / 10,
+  } as PlaylistCache);
   await pipeline
     .exec()
     .then(() => console.debug(`Cached ${tracks.length} tracks`))
@@ -148,9 +159,11 @@ export default async (req: Request, res: Response) => {
     .send(tracks);
 };
 
-const getCachedTracksKey = async () => {
-  console.debug("Fetching caches tracks keys...");
-  const keys = await redis.keys(`${prefix}:tracks:*`).catch(console.error);
+const getCachedTracksKey = async (playlistId: string) => {
+  console.debug("Fetching cached tracks keys...");
+  const keys = await redis
+    .keys(`${prefix}:playlist:${playlistId}:tracks:*`)
+    .catch(console.error);
   keys
     ? console.debug(`Fetched ${keys.length} keys`)
     : console.debug("Unable to get keys... Switching to normal no-cache mode");
