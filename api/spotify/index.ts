@@ -1,10 +1,7 @@
 import { spotifyApi } from "../../utils/spotify";
 import { prefix, redis } from "../../utils/redis";
 import { Track } from "../../utils/types";
-import { Request, Response } from "express";
-
-const hour = 60 * 60 * 1000;
-const ignoreCache = process.env.VERCEL ? false : true;
+import type { Request, Response } from "express";
 
 type AppCache = {
   expire_at: number;
@@ -15,10 +12,14 @@ type PlaylistCache = {
   tracks_expire_at: number;
 };
 
+const hour = 60 * 60 * 1000;
+const ignoreCache = process.env.VERCEL ? false : true;
 const DEFAULT_PLAYLIST_ID = process.env.PLAYLIST_ID;
+
 export default async (req: Request, res: Response) => {
   const playlistId =
-    req.query.playlistId?.toString() ?? (DEFAULT_PLAYLIST_ID as string);
+    req.query.playlistId?.toString() ?? DEFAULT_PLAYLIST_ID;
+  if (!playlistId) return res.status(400).send({ message: "No playlist ID provided (Param is 'playlistId')" });
   const redisAppKey = `${prefix}:cache`;
   const redisPlaylistKey = `${prefix}:playlist-cache:${playlistId}`;
 
