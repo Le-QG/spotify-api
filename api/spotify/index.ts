@@ -3,6 +3,10 @@ import { prefix, redis } from "../../utils/redis";
 import { Track } from "../../utils/types";
 import type { Request, Response } from "express";
 
+export const config = {
+  runtime: 'edge',
+};
+
 type AppCache = {
   expire_at: number;
   access_token: string;
