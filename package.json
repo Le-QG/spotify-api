@@ -1,6 +1,6 @@
 {
   "name": "spotify-api",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "",
   "main": "server.js",
   "scripts": {
@@ -8,13 +8,6 @@
   },
   "author": "",
   "license": "ISC",
-  "dependencies": {
-    "@upstash/redis": "^1.18.1",
-    "dotenv": "^16.0.1",
-    "spotify-web-api-node": "^5.0.2"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.14",
-    "@types/node": "^18.11.13"
-  }
+  "dependencies": {},
+  "devDependencies": {}
 }

@@ -1,7 +1,6 @@
-import { spotifyApi } from "../../utils/spotify";
+import { spotify } from "../../utils/spotify";
 import { prefix, redis } from "../../utils/redis";
 import { Track } from "../../utils/types";
-import type { Request, Response } from "express";
 
 type AppCache = {
   expire_at: number;
@@ -12,28 +11,29 @@ type PlaylistCache = {
   tracks_expire_at: number;
 };
 
+export const config = {
+  runtime: 'edge',
+};
+
 const hour = 60 * 60 * 1000;
 const ignoreCache = false;
 const DEFAULT_PLAYLIST_ID = process.env.PLAYLIST_ID;
 
-export default async (req: Request, res: Response) => {
-  const playlistId = req.query.playlistId?.toString() ?? DEFAULT_PLAYLIST_ID;
-  if (!playlistId)
-    return res
-      .status(400)
-      .send({ message: "No playlist ID provided (Param is 'playlistId')" });
+export default async (req: Request) => {
+  const playlistId = new URL(req.url).searchParams.get("playlistId") ?? DEFAULT_PLAYLIST_ID;
+  if (!playlistId) return new Response("No playlistId provided", { status: 400 });
   const redisAppKey = `${prefix}:cache`;
   const redisPlaylistKey = `${prefix}:playlist-cache:${playlistId}`;
 
   console.log();
-  if (!spotifyApi) {
+  if (!spotify) {
     console.error("spotifyApi wasn't defined and request errored");
-    return res.status(500).send({ message: "Weird error happened" });
+    return new Response("Server error", { status: 500 });
   }
 
   const cachePipeline = redis.pipeline();
-  cachePipeline.hgetall<AppCache>(redisAppKey);
-  cachePipeline.hgetall<PlaylistCache>(redisPlaylistKey);
+  cachePipeline.hgetall(redisAppKey);
+  cachePipeline.hgetall(redisPlaylistKey);
   console.log("Fetching cache...");
   const _cache = await cachePipeline
     .exec()
@@ -47,18 +47,16 @@ export default async (req: Request, res: Response) => {
 
   let accessToken = "";
   if (!cache || cache.expire_at < Date.now() || ignoreCache) {
-    await spotifyApi.refreshAccessToken().then(
-      function (data: { body: { access_token: string } }) {
-        const fetchedAccessToken = data.body["access_token"];
-        console.log(
-          `Found access token ${"*".repeat(fetchedAccessToken.length)}`
-        );
-        redis.hset("spotify-api:cache", {
-          access_token: fetchedAccessToken,
-          expire_at: Date.now() + hour,
-        } as AppCache);
-        accessToken = fetchedAccessToken;
-      },
+    await spotify.getAccessToken().then((fetchedAccessToken) => {
+      console.log(
+        `Found access token ${"*".repeat(fetchedAccessToken.length)}`
+      );
+      redis.hset("spotify-api:cache", {
+        access_token: fetchedAccessToken,
+        expire_at: Date.now() + hour,
+      } as AppCache);
+      accessToken = fetchedAccessToken;
+    },
       function (err: any) {
         console.error("Could not refresh access token");
         console.error(err);
@@ -86,7 +84,12 @@ export default async (req: Request, res: Response) => {
 
       if (tracks) {
         console.log(`Fetched ${tracks.length} cached tracks...`);
-        return res.status(200).send(tracks);
+        return new Response(JSON.stringify(tracks.map((t) => t[1])), {
+          headers: {
+            "Cache-Control": "s-maxage=86400",
+            "Content-Type": "application/json",
+          }
+        });
       }
       console.log(
         "Unable to get cached tracks... Switching to normal no-cache mode"
@@ -95,39 +98,30 @@ export default async (req: Request, res: Response) => {
   }
 
   if (!accessToken)
-    return res
-      .status(500)
-      .send({ message: "Unable to refresh Spotify access token" });
-  spotifyApi.setAccessToken(accessToken);
+    return new Response("Unable to fetch access token", { status: 500 });
 
   console.log("Fetching playlist...");
-  const playlist = await spotifyApi
-    .getPlaylist(playlistId)
-    .then((d: { body: {} }) => d.body)
-    .catch((e: any) => ({
-      __error_message: e?.body?.error?.message,
-      __errored: true,
-    }));
-  if (playlist.__errored)
-    return res.status(500).send({
-      message:
-        "Server error while loading the playlist" +
-        (playlist.__error_message ? ` (${playlist.__error_message})` : ""),
-    });
+  const playlist = await spotify
+    .getPlaylist(playlistId).catch((e: any) => {
+      console.error("Unable to fetch playlist :", e);
+      return new Response("Unable to fetch playlist", { status: 500 });
+    })
+
   console.log(`Found playlist ${playlistId}`);
-  const tracksID = () => {
+  const tracksID = (() => {
     var items = playlist["tracks"]["items"];
     return items
       .splice(0, 50)
       .sort(() => (Math.random() < 0.5 ? 1 : -1))
       .map((t: any) => t["track"]["id"]);
-  };
+  })();
 
-  console.log("Fetching tracks...");
-  const tracks = await spotifyApi
-    .getTracks(tracksID())
-    .then((d: { body: { tracks: Track[] } }) =>
-      d.body.tracks.map((t) => ({
+  console.log(`Fetching tracks ${tracksID.length}...`);
+  const tracks = await spotify
+    .getTracks(tracksID)
+    .then((data: { tracks: Track[] }) =>
+
+      data.tracks.map((t) => ({
         id: t.id,
         name: t.name,
         preview_url: t.preview_url,
@@ -136,9 +130,7 @@ export default async (req: Request, res: Response) => {
     )
     .catch((e: any) => console.error(e));
   if (!tracks)
-    return res
-      .status(500)
-      .send({ message: "Server error while loading the tracks" });
+    return new Response("Unable to fetch tracks", { status: 500 });
   console.log(`Found ${tracks.length} tracks`);
 
   console.log("Caching tracks...");
@@ -161,16 +153,19 @@ export default async (req: Request, res: Response) => {
     .then(() => console.log(`Cached ${tracks.length} tracks`))
     .catch(console.error);
 
-  return res
-    .setHeader("Cache-Control", "s-maxage=86400")
-    .status(200)
-    .send(tracks);
+  return new Response(JSON.stringify(tracks), {
+    headers: {
+      "Cache-Control": "s-maxage=86400",
+      "Content-Type": "application/json",
+    }
+  });
 };
 
 const getCachedTracksKey = async (playlistId: string) => {
   console.log("Fetching cached tracks keys...");
   const keys = await redis
     .keys(`${prefix}:playlist:${playlistId}:tracks:*`)
+    .then((keys) => keys.result)
     .catch(console.error);
   keys
     ? console.log(`Fetched ${keys.length} keys`)
